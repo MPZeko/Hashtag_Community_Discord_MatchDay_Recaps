@@ -1,0 +1,114 @@
+name: Hashtag United Match Recap
+on:
+  schedule:
+    - cron: '3/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [check, dry-run, test-webhook, post-latest, manual-post]
+        default: check
+      team:
+        type: choice
+        options: [all, men, women]
+        default: all
+      home_team:
+        description: Manual-post home team
+        required: false
+      away_team:
+        description: Manual-post away team
+        required: false
+      home_score:
+        description: Manual-post home score
+        required: false
+      away_score:
+        description: Manual-post away score
+        required: false
+      competition:
+        description: Manual-post competition
+        required: false
+      next_fixture:
+        description: Manual-post next fixture text
+        required: false
+      key_moments:
+        description: Manual-post key moments, one per line
+        required: false
+      talking_points:
+        description: Manual-post talking points, one per line
+        required: false
+permissions:
+  contents: write
+concurrency:
+  group: hashtag-united-match-recap
+  cancel-in-progress: false
+jobs:
+  run:
+    name: Run match recap bot
+    if: github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install match recap package
+        run: pip install .
+      - name: Execute selected bot CLI mode
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MODE: ${{ github.event.inputs.mode || 'check' }}
+          TEAM: ${{ github.event.inputs.team || 'all' }}
+          HOME_TEAM: ${{ github.event.inputs.home_team }}
+          AWAY_TEAM: ${{ github.event.inputs.away_team }}
+          HOME_SCORE: ${{ github.event.inputs.home_score }}
+          AWAY_SCORE: ${{ github.event.inputs.away_score }}
+          COMPETITION: ${{ github.event.inputs.competition }}
+          NEXT_FIXTURE: ${{ github.event.inputs.next_fixture }}
+          KEY_MOMENTS: ${{ github.event.inputs.key_moments }}
+          TALKING_POINTS: ${{ github.event.inputs.talking_points }}
+        run: |
+          echo "Executing Hashtag United bot CLI mode: $MODE (team=$TEAM)"
+          if { [ "$MODE" = "test-webhook" ] || [ "$MODE" = "post-latest" ] || [ "$MODE" = "manual-post" ]; } && [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "::error::Discord posting configuration failure: DISCORD_WEBHOOK_URL repository secret is not configured. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [ "$MODE" = "post-latest" ]; then
+            python -m hashtag_bot.cli post-latest --team "$TEAM"
+          elif [ "$MODE" = "manual-post" ]; then
+            args=(manual-post --team "$TEAM" --home-team "$HOME_TEAM" --away-team "$AWAY_TEAM" --home-score "$HOME_SCORE" --away-score "$AWAY_SCORE" --competition "$COMPETITION" --next-fixture "$NEXT_FIXTURE")
+            while IFS= read -r moment; do
+              [ -n "$moment" ] && args+=(--key-moment "$moment")
+            done <<< "$KEY_MOMENTS"
+            while IFS= read -r point; do
+              [ -n "$point" ] && args+=(--talking-point "$point")
+            done <<< "$TALKING_POINTS"
+            python -m hashtag_bot.cli "${args[@]}"
+          else
+            python -m hashtag_bot.cli "$MODE"
+          fi
+      - name: Commit and push updated match bot state
+        if: success()
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          echo "Checking whether data/state.json changed"
+          if git diff --quiet -- data/state.json; then
+            echo "State save result: no data/state.json changes to commit"
+            exit 0
+          fi
+          echo "State save result: data/state.json changed; committing state"
+          git config user.name "hashtag-match-bot"
+          git config user.email "actions@github.com"
+          git add data/state.json
+          git commit -m "chore: update match bot state [skip ci]"
+          echo "Pushing match bot state to $DEFAULT_BRANCH"
+          if ! git push origin "HEAD:$DEFAULT_BRANCH"; then
+            echo "::error::Saving/pushing state failed: git push to $DEFAULT_BRANCH was rejected. Check repository Actions write permissions and branch protection."
+            exit 1
+          fi
