@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
       - uses: actions/setup-python@v5
         with: {python-version: '3.12'}
       - run: pip install .
@@ -44,6 +46,9 @@ jobs:
           fi
       - name: Commit state
         if: success()
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if git diff --quiet -- data/state.json; then
             echo "No state changes"
@@ -53,4 +58,11 @@ jobs:
           git config user.email "actions@github.com"
           git add data/state.json
           git commit -m "chore: update match bot state [skip ci]"
-          git push
+          if git push origin "HEAD:$DEFAULT_BRANCH"; then
+            echo "State pushed to $DEFAULT_BRANCH"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "::warning::State changed but could not be pushed. Check repository Actions write permissions or branch protection. Scheduled runs will fail visibly if this remains blocked."
+          else
+            echo "::error::State changed but could not be pushed. Check repository Actions write permissions or branch protection."
+            exit 1
+          fi
