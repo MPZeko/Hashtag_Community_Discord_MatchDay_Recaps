@@ -8,8 +8,9 @@ from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 
 from hashtag_bot.config import STATE_PATH, TEAMS, get_webhook_url
-from hashtag_bot.discord_client import post_embed
+from hashtag_bot.discord_client import DiscordError, post_embed
 from hashtag_bot.fwp_source import (
+    SourceError,
     fetch_text,
     make_session,
     parse_fixtures,
@@ -181,8 +182,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "test-webhook":
             return test_webhook()
         return post_latest(args.team)
+    except SourceError as exc:
+        log.exception("Failure while fetching Football Web Pages or parsing fixtures: %s", exc)
+        return 1
+    except DiscordError as exc:
+        log.exception("Failure while posting to Discord: %s", exc)
+        return 1
+    except OSError as exc:
+        log.exception("Failure while saving local state: %s", exc)
+        return 1
     except Exception as exc:
-        log.error("%s", exc)
+        log.exception("Unexpected bot failure: %s", exc)
         return 1
 
 
