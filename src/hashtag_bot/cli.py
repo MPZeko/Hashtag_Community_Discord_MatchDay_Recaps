@@ -4,7 +4,8 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, timedelta
+from collections.abc import Iterable
+from datetime import UTC, date, datetime, timedelta
 
 from hashtag_bot.config import STATE_PATH, TEAMS, get_webhook_url
 from hashtag_bot.discord_client import post_embed
@@ -15,6 +16,7 @@ from hashtag_bot.fwp_source import (
     parse_goal_events,
     parse_table,
 )
+from hashtag_bot.models import Match, TableSnapshot, TeamConfig
 from hashtag_bot.recap import build_embed
 from hashtag_bot.state import (
     atomic_write_state,
@@ -27,79 +29,162 @@ from hashtag_bot.state import (
 
 log = logging.getLogger("hashtag_bot")
 
-def _teams(value: str): return TEAMS.values() if value == "all" else [TEAMS[value]]
 
-def _fetch_team(session, team):
+def selected_teams(value: str) -> Iterable[TeamConfig]:
+    return TEAMS.values() if value == "all" else [TEAMS[value]]
+
+
+def fetch_team(session, team: TeamConfig) -> tuple[list[Match], list[Match], TableSnapshot]:
     log.info("Checking %s", team.display_name)
     fixtures = parse_fixtures(fetch_text(session, team.fixtures_url), team)
-    completed = [m for m in fixtures if m.is_finished]
-    log.info("Parsed %s fixtures for %s; %s completed", len(fixtures), team.key, len(completed))
+    completed = [match for match in fixtures if match.is_finished]
+    log.info(
+        "Parsed %s fixtures for %s; %s completed",
+        len(fixtures),
+        team.key,
+        len(completed),
+    )
     table = parse_table(fetch_text(session, team.overview_url), team)
     return fixtures, completed, table
 
-def check() -> int:
-    webhook = get_webhook_url(True); session = make_session(); state = load_state(STATE_PATH); failures = posts = 0
-    if not state.get("initialized"):
-        for team in TEAMS.values():
-            try:
-                _, completed, table = _fetch_team(session, team)
-                for m in completed: record_match(state, m, None)
-                put_table(state, team.key, table)
-            except Exception as exc: failures += 1; log.exception("Source failure for %s: %s", team.key, exc)
-        if failures == len(TEAMS): return 1
-        state["initialized"] = True; atomic_write_state(STATE_PATH, state); log.info("Bot initialized; historical results recorded without posting")
-        return 0
+
+def initialize_state(session, state: dict) -> tuple[int, bool]:
+    failures = 0
     for team in TEAMS.values():
-        try: fixtures, completed, table = _fetch_team(session, team)
-        except Exception as exc: failures += 1; log.exception("Source failure for %s: %s", team.key, exc); continue
-        prev_table = table_from_state(state.get("tables", {}).get(team.key))
-        fresh = [m for m in completed if m.date >= date.today() - timedelta(days=7) and known_score(state, m) != m.score]
+        try:
+            _, completed, table = fetch_team(session, team)
+        except Exception as exc:
+            failures += 1
+            log.exception("Source failure for %s: %s", team.key, exc)
+            continue
+        for match in completed:
+            state.setdefault("matches", {})[match.key] = {
+                "score": match.score,
+                "posted_at": None,
+                "discord_message_id": None,
+                "initialized_at": datetime.now(UTC).isoformat(),
+            }
+        put_table(state, team.key, table)
+    if failures == len(TEAMS):
+        return 1, False
+    state["initialized"] = True
+    atomic_write_state(STATE_PATH, state)
+    log.info("Bot initialized; historical results recorded without posting")
+    log.info("State changed: true")
+    return 0, True
+
+
+def check() -> int:
+    session = make_session()
+    state = load_state(STATE_PATH)
+    if not state.get("initialized"):
+        return initialize_state(session, state)[0]
+
+    webhook = get_webhook_url(True)
+    failures = 0
+    posts = 0
+    for team in TEAMS.values():
+        try:
+            fixtures, completed, table = fetch_team(session, team)
+        except Exception as exc:
+            failures += 1
+            log.exception("Source failure for %s: %s", team.key, exc)
+            continue
+        previous_table = table_from_state(state.get("tables", {}).get(team.key))
+        fresh = [
+            match
+            for match in completed
+            if match.date >= date.today() - timedelta(days=7)
+            and known_score(state, match) != match.score
+        ]
         log.info("%s new or corrected result(s) for %s", len(fresh), team.key)
-        for m in sorted(fresh, key=lambda x: x.date):
-            old = known_score(state, m)
-            goals = parse_goal_events(fetch_text(session, m.detail_url)) if m.detail_url else []
-            msg_id = post_embed(webhook, build_embed(m, goals, fixtures, table, prev_table, old))
-            log.info("Discord message posted for %s: %s", m.key, msg_id)
-            record_match(state, m, msg_id); put_table(state, team.key, table)
-            atomic_write_state(STATE_PATH, state); posts += 1
-    if failures == len(TEAMS): return 1
-    if not posts: log.info("No new result found; Discord not contacted")
+        for match in sorted(fresh, key=lambda item: item.date):
+            old_score = known_score(state, match)
+            goals = parse_goal_events(fetch_text(session, match.detail_url)) if match.detail_url else []
+            embed = build_embed(match, goals, fixtures, table, previous_table, old_score)
+            message_id = post_embed(webhook, embed)
+            log.info("Discord message posted for %s: %s", match.key, message_id)
+            record_match(state, match, message_id)
+            put_table(state, team.key, table)
+            atomic_write_state(STATE_PATH, state)
+            posts += 1
+    if failures == len(TEAMS):
+        return 1
+    if not posts:
+        log.info("No new result found; Discord not contacted")
     log.info("State changed: %s", bool(posts))
     return 0
 
+
 def dry_run() -> int:
-    session = make_session(); embeds = []
+    session = make_session()
+    embeds = []
     for team in TEAMS.values():
-        fixtures, completed, table = _fetch_team(session, team)
-        for m in completed[-2:]: embeds.append(build_embed(m, [], fixtures, table, None))
-    print(json.dumps(embeds, indent=2, ensure_ascii=False)); return 0
+        fixtures, completed, table = fetch_team(session, team)
+        for match in completed[-2:]:
+            embeds.append(build_embed(match, [], fixtures, table, None))
+    print(json.dumps(embeds, indent=2, ensure_ascii=False))
+    return 0
+
 
 def test_webhook() -> int:
     webhook = get_webhook_url(True)
-    post_embed(webhook, {"title":"Hashtag United Match Bot Connected","description":"The Discord webhook is configured correctly. #UPTHETAGS","color":0xF1C232,"footer":{"text":"Source: Football Web Pages • #UPTHETAGS"}})
-    log.info("Webhook test message posted"); return 0
+    post_embed(
+        webhook,
+        {
+            "title": "Hashtag United Match Bot Connected",
+            "description": "The Discord webhook is configured correctly. #UPTHETAGS",
+            "color": 0xF1C232,
+            "footer": {"text": "Source: Football Web Pages • #UPTHETAGS"},
+        },
+    )
+    log.info("Webhook test message posted")
+    return 0
+
 
 def post_latest(team_value: str) -> int:
-    webhook = get_webhook_url(True); session = make_session(); state = load_state(STATE_PATH); count = 0
-    for team in _teams(team_value):
-        fixtures, completed, table = _fetch_team(session, team)
-        if not completed: continue
-        m = sorted(completed, key=lambda x: x.date)[-1]
-        goals = parse_goal_events(fetch_text(session, m.detail_url)) if m.detail_url else []
-        msg_id = post_embed(webhook, build_embed(m, goals, fixtures, table, table_from_state(state.get("tables", {}).get(team.key))))
-        record_match(state, m, msg_id); put_table(state, team.key, table); count += 1
-    if count: atomic_write_state(STATE_PATH, state)
+    webhook = get_webhook_url(True)
+    session = make_session()
+    state = load_state(STATE_PATH)
+    count = 0
+    for team in selected_teams(team_value):
+        fixtures, completed, table = fetch_team(session, team)
+        if not completed:
+            continue
+        match = sorted(completed, key=lambda item: item.date)[-1]
+        goals = parse_goal_events(fetch_text(session, match.detail_url)) if match.detail_url else []
+        previous_table = table_from_state(state.get("tables", {}).get(team.key))
+        message_id = post_embed(webhook, build_embed(match, goals, fixtures, table, previous_table))
+        record_match(state, match, message_id)
+        put_table(state, team.key, table)
+        count += 1
+    if count:
+        atomic_write_state(STATE_PATH, state)
     return 0 if count else 1
+
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("check"); sub.add_parser("dry-run"); sub.add_parser("test-webhook")
-    pl = sub.add_parser("post-latest"); pl.add_argument("--team", choices=["all","men","women"], default="all")
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="cmd", required=True)
+    subparsers.add_parser("check")
+    subparsers.add_parser("dry-run")
+    subparsers.add_parser("test-webhook")
+    post_latest_parser = subparsers.add_parser("post-latest")
+    post_latest_parser.add_argument("--team", choices=["all", "men", "women"], default="all")
+    args = parser.parse_args(argv)
     try:
-        return {"check": check, "dry-run": dry_run, "test-webhook": test_webhook}.get(args.cmd, lambda: post_latest(args.team))()
+        if args.cmd == "check":
+            return check()
+        if args.cmd == "dry-run":
+            return dry_run()
+        if args.cmd == "test-webhook":
+            return test_webhook()
+        return post_latest(args.team)
     except Exception as exc:
-        log.error("%s", exc); return 1
+        log.error("%s", exc)
+        return 1
 
-if __name__ == "__main__": sys.exit(main())
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -32,13 +32,18 @@ jobs:
           MODE: ${{ github.event.inputs.mode || 'check' }}
           TEAM: ${{ github.event.inputs.team || 'all' }}
         run: |
+          echo "Running Hashtag United bot mode=$MODE team=$TEAM"
+          if { [ "$MODE" = "test-webhook" ] || [ "$MODE" = "post-latest" ]; } && [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "::error::DISCORD_WEBHOOK_URL repository secret is not configured. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
           if [ "$MODE" = "post-latest" ]; then
             python -m hashtag_bot.cli post-latest --team "$TEAM"
           else
             python -m hashtag_bot.cli "$MODE"
           fi
       - name: Commit state
-        if: always()
+        if: success()
         run: |
           if git diff --quiet -- data/state.json; then
             echo "No state changes"
