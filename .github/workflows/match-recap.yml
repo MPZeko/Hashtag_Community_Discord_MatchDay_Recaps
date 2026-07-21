@@ -33,17 +33,26 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MODE: ${{ github.event.inputs.mode || 'check' }}
           TEAM: ${{ github.event.inputs.team || 'all' }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           echo "Running Hashtag United bot mode=$MODE team=$TEAM"
           if { [ "$MODE" = "test-webhook" ] || [ "$MODE" = "post-latest" ]; } && [ -z "$DISCORD_WEBHOOK_URL" ]; then
             echo "::error::DISCORD_WEBHOOK_URL repository secret is not configured. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
+          set +e
           if [ "$MODE" = "post-latest" ]; then
             python -m hashtag_bot.cli post-latest --team "$TEAM"
           else
             python -m hashtag_bot.cli "$MODE"
           fi
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] && [ "$EVENT_NAME" = "workflow_dispatch" ] && { [ "$MODE" = "check" ] || [ "$MODE" = "dry-run" ]; }; then
+            echo "::warning::Bot check could not complete, most likely because the public Football Web Pages source was unavailable or its layout changed. Manual check/dry-run runs are treated as diagnostic and will not fail the workflow; scheduled runs still fail visibly."
+            exit 0
+          fi
+          exit "$status"
       - name: Commit state
         if: success()
         env:
