@@ -1,6 +1,30 @@
 {
-  "version": 1,
-  "initialized": false,
-  "matches": {},
-  "tables": {}
+  "initialized": true,
+  "matches": {
+    "men|2026-07-25|A|rugby-borough|friendly": {
+      "discord_message_id": null,
+      "initialized_at": "2026-08-20T09:19:54.204985+00:00",
+      "posted_at": null,
+      "score": "3-3"
+    },
+    "women|2026-08-16|A|lewes|national-league-south": {
+      "discord_message_id": null,
+      "initialized_at": "2026-08-20T09:19:54.561106+00:00",
+      "posted_at": null,
+      "score": "1-1"
+    }
+  },
+  "tables": {
+    "men": {
+      "played": null,
+      "points": null,
+      "position": null
+    },
+    "women": {
+      "played": null,
+      "points": null,
+      "position": null
+    }
+  },
+  "version": 1
 }
